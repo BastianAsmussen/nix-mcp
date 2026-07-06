@@ -1,0 +1,38 @@
+[package]
+name = "nix_mcp"
+description = "MCP server providing LLM agents fast access to the Nix store, evaluator, and flake system"
+version = "0.1.0"
+edition = "2024"
+authors = ["Bastian Asmussen <bastian@asmussen.tech>"]
+readme = "README.md"
+license-file = "LICENSE"
+rust-version = "1.90.0"
+repository = "https://github.com/BastianAsmussen/nix-mcp"
+keywords = ["nix", "mcp", "llm"]
+categories = ["development-tools"]
+
+[dependencies]
+nix-bindings = { version = "0.2347.5", features = ["full"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json"] }
+rmcp = { version = "2.1.0", features = ["server", "macros", "transport-io"] }
+tokio = { version = "1", features = ["rt", "macros"] }
+flume = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# A worker panic must kill the process (see the panic hook in `serve`); abort
+# also never unwinds through live Nix FFI frames. Cargo ignores this for the
+# test and bench profiles, so `cargo test` keeps unwinding.
+[profile.release]
+panic = "abort"
+[dev-dependencies]
+serial_test = "3"
+proptest = "1"
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "nix_ops"
+harness = false
