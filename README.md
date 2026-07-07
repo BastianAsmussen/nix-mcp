@@ -35,7 +35,7 @@ Configure an MCP client to launch this server via stdio:
   "mcpServers": {
     "nix_mcp": {
       "command": "nix",
-      "args": ["run", "github:BastianAsmussen/nix_mcp"]
+      "args": ["run", "github:BastianAsmussen/nix-mcp"]
     }
   }
 }
