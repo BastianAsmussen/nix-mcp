@@ -241,6 +241,48 @@ pub struct DerivationInfoParams {
     pub verbose: Option<bool>,
 }
 
+/// What `nix_config` does.
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigOperation {
+    /// Read the current value of one setting.
+    Get,
+    /// List all known settings whose key contains the query substring
+    /// (or all settings when `query` is omitted), with descriptions and
+    /// current values.
+    Show,
+    /// List setting keys only (optionally filtered by a substring query).
+    List,
+}
+
+impl ConfigOperation {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Get => "get",
+            Self::Show => "show",
+            Self::List => "list",
+        }
+    }
+}
+
+/// Parameters for `nix_config`.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct ConfigParams {
+    /// Which operation to perform.
+    #[schemars(
+        description = "get: read one setting by key. show: list settings with descriptions and current values (filtered by query substring, or all). list: list setting keys only (filtered by query substring, or all)"
+    )]
+    pub operation: ConfigOperation,
+
+    /// The setting key (required for `get`) or a case-insensitive substring
+    /// filter (optional for `show` and `list`).
+    #[schemars(
+        description = "For get: the setting key (e.g. connect-timeout). For show/list: optional case-insensitive substring to filter keys (e.g. timeout)"
+    )]
+    pub query: Option<String>,
+}
+
 /// Parameters for `nix_search`.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct SearchParams {
@@ -291,8 +333,8 @@ mod tests {
     use proptest::prelude::*;
 
     use super::{
-        ClosureType, EvalParams, Page, SearchOperation, SearchParams, SearchSource,
-        StorePathOperation, StorePathQueryParams, truncate_chars,
+        ClosureType, ConfigOperation, ConfigParams, EvalParams, Page, SearchOperation,
+        SearchParams, SearchSource, StorePathOperation, StorePathQueryParams, truncate_chars,
     };
 
     #[test]
@@ -515,5 +557,39 @@ mod tests {
             }
             prop_assert_eq!(visited, count);
         }
+    }
+
+    #[test]
+    fn config_operation_deserializes_from_snake_case() {
+        let parse = |s| serde_json::from_str::<ConfigOperation>(s).expect("valid");
+        assert_eq!(parse("\"get\"").as_str(), "get");
+        assert_eq!(parse("\"show\"").as_str(), "show");
+        assert_eq!(parse("\"list\"").as_str(), "list");
+        serde_json::from_str::<ConfigOperation>("\"dump\"").expect_err("unknown rejected");
+    }
+
+    #[test]
+    fn config_params_require_an_operation() {
+        serde_json::from_str::<ConfigParams>("{}").expect_err("operation is required");
+        serde_json::from_str::<ConfigParams>(r#"{"query":"timeout"}"#)
+            .expect_err("query alone is not enough");
+
+        let p: ConfigParams = serde_json::from_str(r#"{"operation":"get","query":"timeout"}"#)
+            .expect("valid config params");
+        assert!(matches!(p.operation, ConfigOperation::Get));
+        assert_eq!(p.query.as_deref(), Some("timeout"));
+    }
+
+    #[test]
+    fn config_params_query_is_optional_for_show_and_list() {
+        let p: ConfigParams =
+            serde_json::from_str(r#"{"operation":"show"}"#).expect("valid config params");
+        assert!(matches!(p.operation, ConfigOperation::Show));
+        assert!(p.query.is_none());
+
+        let p: ConfigParams =
+            serde_json::from_str(r#"{"operation":"list"}"#).expect("valid config params");
+        assert!(matches!(p.operation, ConfigOperation::List));
+        assert!(p.query.is_none());
     }
 }

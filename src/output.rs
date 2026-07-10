@@ -214,6 +214,47 @@ pub struct FlakeResolveResult {
     pub outputs: Vec<String>,
 }
 
+/// One `nix_config` setting entry.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ConfigSettingEntry {
+    /// The canonical setting key.
+    pub key: String,
+    /// Deprecated/alternative names, if any.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
+    /// Short description of what the setting controls.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The experimental feature gate, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub experimental_feature: Option<String>,
+    /// The setting's current value, as reported by the Nix C API.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+}
+
+/// `nix_config` result.
+///
+/// One flat object covering all three operations (`get`, `show`, `list`);
+/// `get` populates `setting`, `show`/`list` populate `settings` and `count`.
+#[derive(Debug, Default, Serialize, JsonSchema)]
+pub struct ConfigResult {
+    /// The operation that was performed: "get", "show", or "list".
+    pub operation: String,
+    /// The filter substring, echoed back (null for `get` without a filter).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+    /// `get`: the single setting that was read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub setting: Option<ConfigSettingEntry>,
+    /// `show`/`list`: total matching settings.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub count: Option<usize>,
+    /// `show`/`list`: the matching settings.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub settings: Option<Vec<ConfigSettingEntry>>,
+}
+
 /// `nix_derivation_info` result: the derivation's own JSON object.
 ///
 /// The shape comes from Nix itself (name, system, builder, args, env,
@@ -226,8 +267,8 @@ pub struct DerivationJson(pub serde_json::Map<String, serde_json::Value>);
 #[cfg(test)]
 mod tests {
     use super::{
-        DerivationJson, EvalResult, FlakeResolveResult, RealizeResult, SearchItem, SearchResult,
-        StoreInfo, StorePathQueryResult, schema,
+        ConfigResult, DerivationJson, EvalResult, FlakeResolveResult, RealizeResult, SearchItem,
+        SearchResult, StoreInfo, StorePathQueryResult, schema,
     };
 
     #[test]
@@ -242,6 +283,7 @@ mod tests {
             schema::<FlakeResolveResult>(),
             schema::<DerivationJson>(),
             schema::<SearchResult>(),
+            schema::<ConfigResult>(),
         ] {
             assert_eq!(s["type"], "object", "schema root must be an object");
         }

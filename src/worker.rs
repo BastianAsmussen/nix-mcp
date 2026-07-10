@@ -26,10 +26,13 @@ use std::sync::Arc;
 
 use nix_bindings::{Context, EvalState, EvalStateBuilder, Store, flake::FlakeSettings};
 
+use crate::config;
 use crate::error::{NixMcpError, Result};
 use crate::output;
 use crate::search;
-use crate::tools::{ClosureType, Page, SearchOperation, StorePathOperation, truncate_chars};
+use crate::tools::{
+    ClosureType, ConfigOperation, Page, SearchOperation, StorePathOperation, truncate_chars,
+};
 
 /// Serialize a reply payload built from one of the [`crate::output`] structs.
 ///
@@ -124,6 +127,15 @@ pub enum NixOp {
         /// Where to send the JSON reply.
         reply: Reply,
     },
+    /// Read Nix configuration settings via the C API.
+    Config {
+        /// Which config operation to perform.
+        operation: ConfigOperation,
+        /// Setting key (for `get`) or filter substring (for `show`/`list`).
+        query: Option<String>,
+        /// Where to send the JSON reply.
+        reply: Reply,
+    },
 }
 
 /// Per-value cap, in characters, applied to derivation JSON in summary mode.
@@ -176,6 +188,10 @@ pub struct NixWorker {
     flake_settings: Arc<FlakeSettings>,
     /// The evaluator state.
     eval_state: EvalState,
+    /// Cached output of `nix config show --json`, populated on first
+    /// `nix_config` call. Nix config is process-global and immutable for
+    /// the lifetime of a session, so one subprocess call suffices.
+    config_cache: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 impl NixWorker {
@@ -223,6 +239,7 @@ impl NixWorker {
             store,
             flake_settings,
             eval_state,
+            config_cache: None,
         })
     }
 
@@ -240,7 +257,7 @@ impl NixWorker {
         ready: flume::Sender<std::result::Result<(), String>>,
     ) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
-            let worker = match Self::new() {
+            let mut worker = match Self::new() {
                 Ok(worker) => worker,
                 Err(err) => {
                     tracing::error!(%err, "failed to initialize Nix worker");
@@ -259,7 +276,7 @@ impl NixWorker {
     }
 
     /// Process each incoming [`NixOp`] sequentially until `rx` closes.
-    fn run(&self, rx: flume::Receiver<NixOp>) {
+    fn run(&mut self, rx: flume::Receiver<NixOp>) {
         for op in rx {
             match op {
                 NixOp::Ping(reply) => {
@@ -316,6 +333,13 @@ impl NixWorker {
                             self.handle_search_pinned(operation, &query, &flake, offset, limit),
                         ),
                     );
+                }
+                NixOp::Config {
+                    operation,
+                    query,
+                    reply,
+                } => {
+                    drop(reply.send(self.handle_config(operation, query.as_deref())));
                 }
             }
         }
@@ -825,6 +849,174 @@ impl NixWorker {
                 .map(search::PinnedItem::into_output)
                 .collect(),
         })
+    }
+
+    /// Read Nix configuration settings by shelling out to
+    /// `nix config show --json`, enriched with static metadata (descriptions,
+    /// aliases, experimental-feature gates) from [`config::KNOWN_SETTINGS`].
+    ///
+    /// The Nix C API's `nix_setting_get` aborts (uncatchable C++ exception)
+    /// on several valid setting keys that exist in the CLI but are not
+    /// registered in the C API's global settings table. Shelling out to the
+    /// CLI is the only safe way to read all 129 settings.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NixMcpError::InvalidArgument`] if `get` is called without a
+    /// query or with an unknown key, or [`NixMcpError::Internal`] if the
+    /// subprocess fails.
+    pub fn handle_config(
+        &mut self,
+        operation: ConfigOperation,
+        query: Option<&str>,
+    ) -> Result<String> {
+        match operation {
+            ConfigOperation::Get => {
+                let key = query.ok_or_else(|| {
+                    NixMcpError::InvalidArgument(
+                        "operation=get requires a query (the setting key, e.g. connect-timeout)"
+                            .to_owned(),
+                    )
+                })?;
+
+                let meta = config::find_setting(key).ok_or_else(|| {
+                    NixMcpError::InvalidArgument(format!(
+                        "unknown setting '{key}'; use operation=list to see all known keys"
+                    ))
+                })?;
+
+                let live = self.config_snapshot()?;
+                let value = live
+                    .get(meta.key)
+                    .and_then(|v| v.get("value"))
+                    .map(Self::format_config_value);
+
+                render(&output::ConfigResult {
+                    operation: "get".to_owned(),
+                    query: Some(meta.key.to_owned()),
+                    setting: Some(Self::setting_entry(meta, value.as_deref(), true)),
+                    ..output::ConfigResult::default()
+                })
+            }
+
+            ConfigOperation::Show | ConfigOperation::List => {
+                let include_details = matches!(operation, ConfigOperation::Show);
+                let lower_query = query.map(str::to_lowercase);
+
+                let live = if include_details {
+                    self.config_snapshot()?
+                } else {
+                    &serde_json::Map::new()
+                };
+
+                let mut entries = Vec::new();
+                for meta in config::KNOWN_SETTINGS {
+                    if let Some(ref lq) = lower_query {
+                        let matches_key = meta.key.contains(lq.as_str());
+                        let matches_alias = meta.aliases.iter().any(|a| a.contains(lq.as_str()));
+                        if !matches_key && !matches_alias {
+                            continue;
+                        }
+                    }
+
+                    let value = live
+                        .get(meta.key)
+                        .and_then(|v| v.get("value"))
+                        .map(Self::format_config_value);
+
+                    entries.push(Self::setting_entry(meta, value.as_deref(), include_details));
+                }
+
+                render(&output::ConfigResult {
+                    operation: operation.as_str().to_owned(),
+                    query: query.map(str::to_owned),
+                    count: Some(entries.len()),
+                    settings: Some(entries),
+                    ..output::ConfigResult::default()
+                })
+            }
+        }
+    }
+
+    /// Return a reference to the cached `nix config show --json` output,
+    /// running the subprocess once on first call.
+    fn config_snapshot(&mut self) -> Result<&serde_json::Map<String, serde_json::Value>> {
+        if self.config_cache.is_none() {
+            self.config_cache = Some(Self::nix_config_show()?);
+        }
+        Ok(self.config_cache.as_ref().expect("just populated"))
+    }
+
+    /// Run `nix config show --json` and parse the result.
+    fn nix_config_show() -> Result<serde_json::Map<String, serde_json::Value>> {
+        let output = std::process::Command::new("nix")
+            .args(["config", "show", "--json"])
+            .output()
+            .map_err(|e| NixMcpError::Internal(format!("failed to run nix config show: {e}")))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(NixMcpError::Internal(format!(
+                "nix config show failed: {stderr}"
+            )));
+        }
+
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).map_err(|e| {
+            NixMcpError::Internal(format!("failed to parse nix config show output: {e}"))
+        })?;
+
+        value.as_object().cloned().ok_or_else(|| {
+            NixMcpError::Internal("nix config show did not return an object".to_owned())
+        })
+    }
+
+    fn format_config_value(value: &serde_json::Value) -> String {
+        match value {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Bool(b) => b.to_string(),
+            serde_json::Value::Number(n) => n.to_string(),
+            serde_json::Value::Null => String::new(),
+            serde_json::Value::Array(arr) => {
+                let items: Vec<String> = arr.iter().map(Self::format_config_value).collect();
+                items.join(" ")
+            }
+            serde_json::Value::Object(map) => {
+                let items: Vec<String> = map
+                    .iter()
+                    .map(|(k, v)| {
+                        let val = Self::format_config_value(v);
+                        format!("{k}={val}")
+                    })
+                    .collect();
+                items.join(" ")
+            }
+        }
+    }
+
+    fn setting_entry(
+        meta: &config::SettingMeta,
+        value: Option<&str>,
+        include_details: bool,
+    ) -> output::ConfigSettingEntry {
+        output::ConfigSettingEntry {
+            key: meta.key.to_owned(),
+            aliases: if include_details {
+                meta.aliases.iter().map(|a| (*a).to_owned()).collect()
+            } else {
+                Vec::new()
+            },
+            description: if include_details {
+                Some(meta.description.to_owned())
+            } else {
+                None
+            },
+            experimental_feature: if include_details {
+                meta.experimental_feature.map(str::to_owned)
+            } else {
+                None
+            },
+            value: value.map(str::to_owned),
+        }
     }
 }
 
@@ -1671,5 +1863,132 @@ mod tests {
                 10,
             )
             .expect_err("a missing flake must surface a Nix error");
+    }
+
+    #[test]
+    #[serial]
+    fn config_get_reads_a_known_setting() {
+        use crate::tools::ConfigOperation;
+
+        let mut worker = NixWorker::new().expect("worker init");
+        let out = worker
+            .handle_config(ConfigOperation::Get, Some("connect-timeout"))
+            .expect("config get");
+        let v: serde_json::Value = serde_json::from_str(&out).expect("json");
+        assert_eq!(v["operation"], "get");
+        assert_eq!(v["setting"]["key"], "connect-timeout");
+        assert!(v["setting"]["value"].is_string(), "value must be present");
+        assert!(
+            v["setting"]["description"].is_string(),
+            "description must be present"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn config_get_rejects_unknown_keys() {
+        use crate::tools::ConfigOperation;
+
+        let mut worker = NixWorker::new().expect("worker init");
+        let err = worker
+            .handle_config(ConfigOperation::Get, Some("not-a-real-setting"))
+            .expect_err("unknown key");
+        let msg = err.to_string();
+        assert!(msg.contains("unknown setting"), "got: {msg}");
+        assert!(msg.contains("operation=list"), "got: {msg}");
+    }
+
+    #[test]
+    #[serial]
+    fn config_get_requires_a_query() {
+        use crate::tools::ConfigOperation;
+
+        let mut worker = NixWorker::new().expect("worker init");
+        let err = worker
+            .handle_config(ConfigOperation::Get, None)
+            .expect_err("missing query");
+        assert!(err.to_string().contains("requires a query"));
+    }
+
+    #[test]
+    #[serial]
+    fn config_show_returns_all_settings_when_unfiltered() {
+        use crate::tools::ConfigOperation;
+
+        let mut worker = NixWorker::new().expect("worker init");
+        let out = worker
+            .handle_config(ConfigOperation::Show, None)
+            .expect("config show");
+        let v: serde_json::Value = serde_json::from_str(&out).expect("json");
+        assert_eq!(v["operation"], "show");
+        let count = v["count"].as_u64().expect("count");
+        assert!(count >= 100, "expected 100+ settings, got {count}");
+        let settings = v["settings"].as_array().expect("settings array");
+        assert_eq!(settings.len(), count as usize);
+        // Most settings have a value; some gated by experimental features may
+        // not. At least the well-known ones should be readable.
+        let has_value = settings.iter().filter(|s| s["value"].is_string()).count();
+        assert!(
+            has_value >= 100,
+            "most settings should have values, got {has_value}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn config_show_filters_by_substring() {
+        use crate::tools::ConfigOperation;
+
+        let mut worker = NixWorker::new().expect("worker init");
+        let out = worker
+            .handle_config(ConfigOperation::Show, Some("timeout"))
+            .expect("config show timeout");
+        let v: serde_json::Value = serde_json::from_str(&out).expect("json");
+        assert_eq!(v["query"], "timeout");
+        let settings = v["settings"].as_array().expect("settings array");
+        assert!(
+            settings.len() >= 2,
+            "at least connect-timeout and stalled-download-timeout"
+        );
+        for s in settings {
+            let key = s["key"].as_str().expect("key");
+            assert!(key.contains("timeout"), "filtered result must match: {key}");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn config_list_returns_keys_only() {
+        use crate::tools::ConfigOperation;
+
+        let mut worker = NixWorker::new().expect("worker init");
+        let out = worker
+            .handle_config(ConfigOperation::List, Some("timeout"))
+            .expect("config list timeout");
+        let v: serde_json::Value = serde_json::from_str(&out).expect("json");
+        assert_eq!(v["operation"], "list");
+        let settings = v["settings"].as_array().expect("settings array");
+        assert!(!settings.is_empty());
+        for s in settings {
+            assert!(s["key"].is_string());
+            assert!(s.get("description").is_none(), "list omits descriptions");
+            assert!(s.get("value").is_none(), "list omits values");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn config_get_resolves_aliases() {
+        use crate::tools::ConfigOperation;
+
+        let mut worker = NixWorker::new().expect("worker init");
+        let out = worker
+            .handle_config(ConfigOperation::Get, Some("build-cores"))
+            .expect("config get by alias");
+        let v: serde_json::Value = serde_json::from_str(&out).expect("json");
+        assert_eq!(
+            v["setting"]["key"], "cores",
+            "alias resolves to canonical key"
+        );
     }
 }

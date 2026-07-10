@@ -24,6 +24,7 @@
     reason = "unfixable transitive skew (getrandom majors, r-efi, windows-sys)"
 )]
 
+pub mod config;
 pub mod error;
 pub mod output;
 pub mod search;
@@ -423,6 +424,34 @@ impl NixMcp {
             }
         }
     }
+
+    /// Query Nix configuration settings (nix.conf).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only if the worker is unavailable; invalid arguments
+    /// and setting-read failures are reported in-band in the tool result.
+    #[tool(
+        description = "Query nix.conf settings (connect-timeout, stalled-download-timeout, substituters, etc.): the keys in nix.conf / nix.settings that are NOT NixOS module options and do not appear in nix_search. operation = get (read one setting by key) | show (list settings with descriptions and current values, optionally filtered by a substring query) | list (list setting keys only, optionally filtered). For get: query is the setting key (e.g. connect-timeout). For show/list: query is an optional case-insensitive substring filter (e.g. timeout). Returns JSON.",
+        output_schema = output::schema::<output::ConfigResult>(),
+        annotations(
+            title = "Nix config",
+            read_only_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn nix_config(
+        &self,
+        Parameters(p): Parameters<tools::ConfigParams>,
+    ) -> std::result::Result<CallToolResult, rmcp::ErrorData> {
+        self.send_op(|reply| NixOp::Config {
+            operation: p.operation,
+            query: p.query,
+            reply,
+        })
+        .await
+    }
 }
 
 #[tool_handler]
@@ -660,13 +689,12 @@ mod tests {
         let router = NixMcp::tool_router();
         let tools = router.list_all();
 
-        // Exactly seven tools with these exact names: a macro-attribute typo
-        // renaming one would otherwise go unnoticed until a client breaks.
         let mut names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
         names.sort_unstable();
         assert_eq!(
             names,
             [
+                "nix_config",
                 "nix_derivation_info",
                 "nix_eval",
                 "nix_flake_resolve",
@@ -712,6 +740,8 @@ mod tests {
             annotations("nix_derivation_info").read_only_hint,
             Some(true)
         );
+        assert_eq!(annotations("nix_config").read_only_hint, Some(true));
+        assert_eq!(annotations("nix_config").open_world_hint, Some(false));
         // eval and flake_resolve write to the store and reach the network.
         assert_eq!(annotations("nix_eval").read_only_hint, Some(false));
         assert_eq!(annotations("nix_eval").open_world_hint, Some(true));
@@ -731,6 +761,15 @@ mod tests {
             assert!(
                 search_schema.contains(token),
                 "search variant {token} missing from the input schema"
+            );
+        }
+
+        let config_schema =
+            serde_json::to_string(&tool("nix_config").input_schema).expect("schema serializes");
+        for variant in ["get", "show", "list"] {
+            assert!(
+                config_schema.contains(variant),
+                "config operation variant {variant} missing from the input schema"
             );
         }
 
